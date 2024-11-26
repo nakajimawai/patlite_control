@@ -3,6 +3,7 @@
 #include <chrono>
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/int32.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "hidapi/hidapi.h"
 #include <unistd.h>
 
@@ -31,6 +32,14 @@ public:
         // サブスクライバの作成: 整数メッセージを購読して色を変更
         subscription_ = this->create_subscription<std_msgs::msg::Int32>(
             "led_color", 10, std::bind(&PatliteNode::color_callback, this, std::placeholders::_1));
+
+        // タッチセンサの状態を監視するタイマ
+        touch_timer_ = this -> create_wall_timer(
+            100ms, std::bind(&PatliteNode::monitor_touch_sensor, this));
+        
+        // タッチセンサの状態を知らせるためのパブリッシャ
+        touch_publisher_ = this -> create_publisher<std_msgs::msg::String>("socket_topic", 10);
+
     }
 
     ~PatliteNode() {
@@ -60,8 +69,47 @@ private:
                 std::cerr << "Invalid color code received: " << msg->data << std::endl;
                 break;
             
-            sleep(2);
         }
+    }
+
+    void monitor_touch_sensor()
+    {
+        uint8_t buf2[3] = {};
+        int result = patlite_get(buf2);
+
+        if (result == -1){
+            RCLCPP_ERROR(this->get_logger(), "Failed to read from Patlite device.");
+            return;
+        }
+
+    std_msgs::msg::String touch_msg;
+    // タッチセンサが入力されたかを監視
+    if (buf2[1] == 0x01 || buf2[1] == 0x11) {  // タッチセンサ入力ありの場合
+        touch_msg.data = "s";
+        touch_publisher_->publish(touch_msg); // 停止指令パブリッシュ
+        patlite_lights(LED_COLORS::PURPLE, LED_PATTERNS::CONTINUOUS); // 点灯色を紫に
+        }
+    }
+
+    int patlite_get(u_int8_t *buf2){
+        int result = 0;
+
+        if (patlite_handle == nullptr){
+            std::cerr << "Unable to open device. Please check that it is connected." << std::endl;
+            return -1;
+        } else {
+            uint8_t buf[9] = {0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            result = hid_write(patlite_handle, buf, 9);
+
+            if (result == -1){
+                std::cerr << "Patlite set failed, return " << result << "." << std::endl;
+                return result;
+            }
+
+            result = hid_read(patlite_handle, buf2, 3);
+        }
+
+        return result;
     }
 
     int patlite_lights(LED_COLORS color, LED_PATTERNS ptn) {
@@ -134,6 +182,8 @@ private:
     }
 
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr subscription_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr touch_publisher_; // 停止命令送信用のパブリッシャ
+    rclcpp::TimerBase::SharedPtr touch_timer_; // 定期的にタッチセンサの状態を監視するためのタイマ
     static hid_device *patlite_handle;
 };
 
