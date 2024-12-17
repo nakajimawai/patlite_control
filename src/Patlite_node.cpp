@@ -6,6 +6,7 @@
 #include "std_msgs/msg/string.hpp"
 #include "hidapi/hidapi.h"
 #include <unistd.h>
+#include <chrono>
 
 using namespace std::chrono_literals;
 
@@ -17,10 +18,17 @@ enum class LED_PATTERNS {
     OFF, CONTINUOUS
 };
 
-class PatliteNode : public rclcpp::Node
-{
+class PatliteNode : public rclcpp::Node{
+private:
+    bool emergency_stop_; // 緊急停止フラグ
+    std::chrono::steady_clock::time_point touch_start_time_; //タッチ開始時刻
+    std::chrono::steady_clock::duration press_duration_;     // タッチ継続時間
+
 public:
-    PatliteNode() : Node("patlite_node")
+    PatliteNode() : Node("patlite_node"),
+                    emergency_stop_(false),
+                    touch_start_time_(std::chrono::steady_clock::time_point::min()),
+                    press_duration_(0ms)
     {
         // 初期化
         patlite_init();
@@ -82,12 +90,50 @@ private:
             return;
         }
 
-    std_msgs::msg::String touch_msg;
-    // タッチセンサが入力されたかを監視
-    if (buf2[1] == 0x01 || buf2[1] == 0x11) {  // タッチセンサ入力ありの場合
-        touch_msg.data = "s";
-        touch_publisher_->publish(touch_msg); // 停止指令パブリッシュ
-        patlite_lights(LED_COLORS::PURPLE, LED_PATTERNS::CONTINUOUS); // 点灯色を紫に
+        std_msgs::msg::String touch_msg; //WHILL制御用メッセージ宣言
+
+        // タッチセンサが入力されたかを監視
+        bool is_touched = (buf2[1] == 0x01 || buf2[1] == 0x11);
+        
+        if (is_touched){ // タッチされた場合
+            if (touch_start_time_ == std::chrono::steady_clock::time_point::min()){
+                // タッチが開始された時刻を記録
+                touch_start_time_ = std::chrono::steady_clock::now();
+            } else {
+                // タッチの継続時間を計測
+                press_duration_ = std::chrono::steady_clock::now() - touch_start_time_;
+
+                // 緊急停止状態で3秒以上押された場合、解除
+                if (emergency_stop_ &&  press_duration_ >= 2s){
+                    emergency_stop_ = false; // 緊急停止解除
+                    RCLCPP_INFO(this -> get_logger(), "緊急停止解除");
+                    
+                    //　socket_topicに解除することを通知
+                    touch_msg.data = "EG_stop_R";
+                    touch_publisher_ -> publish(touch_msg);
+                    
+                    // 緑点灯
+                    patlite_lights(LED_COLORS::GREEN, LED_PATTERNS::CONTINUOUS);
+                }
+            }
+        } else {
+            if (touch_start_time_ != std::chrono::steady_clock::time_point::min()) {
+                // タッチセンサが離された場合、短押しで緊急停止を有効化
+                if (!emergency_stop_ && press_duration_ < 2s) {
+                    emergency_stop_ = true; 
+                    RCLCPP_INFO(this -> get_logger(), "緊急停止");
+
+                    //　socket_topicに緊急停止することを通知
+                    touch_msg.data = "EG_stop";
+                    touch_publisher_ -> publish(touch_msg);
+
+                    // 紫点灯
+                    patlite_lights(LED_COLORS::PURPLE, LED_PATTERNS::CONTINUOUS);
+                }
+                // タッチセンサ状態のリセット
+                touch_start_time_ = std::chrono::steady_clock::time_point::min();
+                press_duration_ = 0ms;
+            }
         }
     }
 
@@ -184,6 +230,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr subscription_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr touch_publisher_; // 停止命令送信用のパブリッシャ
     rclcpp::TimerBase::SharedPtr touch_timer_; // 定期的にタッチセンサの状態を監視するためのタイマ
+
     static hid_device *patlite_handle;
 };
 
